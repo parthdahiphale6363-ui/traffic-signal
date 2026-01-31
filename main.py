@@ -1,949 +1,792 @@
-# main.py (Improved with continuous vehicle flow and performance optimizations)
+# main.py — Complete Fixed Traffic Simulation with Images
 from PIL import Image, ImageTk
 import tkinter as tk
-from tkinter import ttk
-import random, time, math, threading, sys, os
-from collections import deque
-from typing import Optional, List, Dict, Tuple
-
-# Audio imports
-USE_PYGAME = False
-try:
-    import pygame
-    USE_PYGAME = True
-    pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
-except Exception:
-    USE_PYGAME = False
-    if sys.platform.startswith("win"):
-        import winsound
+from tkinter import ttk, messagebox
+import random, time, math, threading, os
+from collections import deque, defaultdict
+from typing import Optional, Dict, List, Tuple
+import statistics
 
 # -------------------------
-# Configuration
+# CONFIG
 # -------------------------
 CANVAS_W = 1000
 CANVAS_H = 700
 
 GREEN_TIME = 8
 YELLOW_TIME = 2
-EMERGENCY_TIME = 8
-CHECK_INTERVAL = 200
-ANIM_INTERVAL = 16  # ~60 FPS for smoother animation
+EMERGENCY_HOLD = 6      # seconds to hold after emergency passes
+AUTO_GREEN_DIST = 150   # distance threshold to auto-green for approaching emergency
+PREEMPTION_DIST = 250   # distance for traffic preemption (clear path)
 
-# Vehicle speeds (in pixels per frame)
+CHECK_INTERVAL = 200    # ms for controller tick
+ANIM_INTERVAL = 16      # ms for animation (~60fps)
+
+# Speeds (pixels per frame base)
 CAR_BASE_SPEED = 2.5
-AMB_BASE_SPEED = 4.0
-FIRE_BASE_SPEED = 3.5
+AMB_BASE_SPEED = 4.5
+FIRE_BASE_SPEED = 4.0
+BUS_BASE_SPEED = 2.0
 
 # Distances
-STOP_DIST = 70
-VEHICLE_SPAWN_DIST = 150  # Distance from intersection to spawn
-VEHICLE_DESPAWN_DIST = 300  # Distance from intersection to despawn
-MIN_SPACING = 40  # Minimum space between vehicles
+STOP_DIST = 140
+VEHICLE_SPAWN_DIST = 160
+VEHICLE_DESPAWN_DIST = 350
+MIN_SPACING = 45
 
-# Colors
+# Colors / UI
 ROAD_COLOR = "#333"
 CENTER_COLOR = "#222"
 BG_COLOR = "#e9eaec"
 PANEL_BG = "#f7f9fb"
 
-# -------------------------
-# Audio Manager
-# -------------------------
-class AudioManager:
-    def __init__(self):
-        self.sounds = {}
-        self.load_sounds()
-        
-    def load_sounds(self):
-        """Load all sound files"""
-        ASSET_SND_PATH = "./assets/"
-        sound_files = {
-            "car_horn": "car_horn.wav",
-            "ambulance_siren": "ambulance_siren.wav",
-            "firetruck_siren": "firetruck_siren.wav",
-            "engine": "engine.wav",
-        }
-        
-        for name, filename in sound_files.items():
-            full_path = os.path.join(ASSET_SND_PATH, filename)
-            if os.path.exists(full_path):
-                if USE_PYGAME:
-                    try:
-                        self.sounds[name] = pygame.mixer.Sound(full_path)
-                    except:
-                        self.sounds[name] = None
-                else:
-                    self.sounds[name] = full_path
-            else:
-                self.sounds[name] = None
-    
-    def play_sound(self, name, loop=False):
-        """Play a sound by name"""
-        sound = self.sounds.get(name)
-        if not sound:
-            return None
-            
-        if USE_PYGAME:
-            try:
-                if loop:
-                    channel = pygame.mixer.find_channel()
-                    if channel:
-                        channel.play(sound, loops=-1)
-                        return channel
-                else:
-                    sound.play()
-            except:
-                pass
-        elif sys.platform.startswith("win"):
-            try:
-                if loop:
-                    winsound.PlaySound(sound, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
-                else:
-                    winsound.PlaySound(sound, winsound.SND_FILENAME | winsound.SND_ASYNC)
-            except:
-                pass
-        return None
-    
-    def stop_sound(self, channel_or_handle):
-        """Stop a playing sound"""
-        if channel_or_handle and USE_PYGAME:
-            try:
-                channel_or_handle.stop()
-            except:
-                pass
-        elif sys.platform.startswith("win"):
-            try:
-                winsound.PlaySound(None, winsound.SND_PURGE)
-            except:
-                pass
+# Queue Visualization
+QUEUE_MAX_VEHICLES = 8
+QUEUE_VEHICLE_SIZE = 20
+QUEUE_SPACING = 5
+QUEUE_COLORS = {
+    "car": "#3498db",
+    "ambulance": "#e74c3c", 
+    "firetruck": "#e67e22",
+    "bus": "#2ecc71"
+}
 
 # -------------------------
-# Traffic Controller
+# Statistics Manager
+# -------------------------
+class StatisticsManager:
+    def __init__(self):
+        self.reset()
+        
+    def reset(self):
+        self.start_time = time.time()
+        self.vehicle_stats = defaultdict(lambda: {"count": 0, "passed": 0, "wait_times": []})
+        self.signal_changes = []
+        self.emergency_events = []
+        
+    def log_vehicle(self, vehicle_type, passed=False, wait_time=0):
+        self.vehicle_stats[vehicle_type]["count"] += 1
+        if passed:
+            self.vehicle_stats[vehicle_type]["passed"] += 1
+        if wait_time > 0:
+            self.vehicle_stats[vehicle_type]["wait_times"].append(wait_time)
+            
+    def log_signal_change(self, from_state, to_state):
+        self.signal_changes.append({
+            "time": time.time(),
+            "from": from_state,
+            "to": to_state
+        })
+        
+    def log_emergency(self, vehicle_type, direction, response_time):
+        self.emergency_events.append({
+            "time": time.time(),
+            "type": vehicle_type,
+            "direction": direction,
+            "response_time": response_time
+        })
+        
+    def get_statistics(self):
+        stats = {
+            "total_time": time.time() - self.start_time,
+            "total_vehicles": sum(v["count"] for v in self.vehicle_stats.values()),
+            "vehicle_types": dict(self.vehicle_stats),
+            "avg_wait_times": {},
+            "emergency_response_avg": 0,
+        }
+        
+        for vtype, data in self.vehicle_stats.items():
+            if data["wait_times"]:
+                stats["avg_wait_times"][vtype] = statistics.mean(data["wait_times"])
+                
+        if self.emergency_events:
+            stats["emergency_response_avg"] = statistics.mean(e["response_time"] for e in self.emergency_events)
+            
+        return stats
+
+# -------------------------
+# TrafficController
 # -------------------------
 class TrafficController:
     def __init__(self, ui):
         self.ui = ui
-        self.signals = {
-            "north": "red",
-            "south": "red", 
-            "east": "red",
-            "west": "red"
-        }
-        self.emergency_queue = deque()
-        self.cycle_state = "ns_green"
-        self.state_timer = GREEN_TIME
-        self.override_active = False
-        self.override_direction = None
-        self.override_timer = 0
         self.running = False
         
+        # signals
+        self.signals = {"north": "red", "south": "red", "east": "red", "west": "red"}
+        
+        # normal cycle
+        self.cycle_state = "ns_green"
+        self.state_timer = GREEN_TIME
+        
+        # emergency queue and override
+        self.emergency_queue = deque()
+        self.override_active = False
+        self.override_direction = None
+        self.override_timer = 0.0
+        
+        # statistics
+        self.statistics = StatisticsManager()
+
     def start(self):
         if not self.running:
             self.running = True
             self.set_ns_green()
             self._tick()
-    
+
     def stop(self):
         self.running = False
-    
+
     def add_emergency(self, direction: str, vehicle_type: str):
-        """Add emergency vehicle to queue"""
-        emergency = {
-            "direction": direction,
-            "type": vehicle_type,
-            "time": time.time()
-        }
+        emergency = {"direction": direction, "type": vehicle_type, "time": time.time()}
         self.emergency_queue.append(emergency)
         self.ui.log_event(f"Emergency queued: {vehicle_type.upper()} from {direction.upper()}")
-    
-    def get_next_emergency(self):
-        """Get highest priority emergency"""
+        
+        # Start response timer
+        self.statistics.log_emergency(vehicle_type, direction, 0)
+        
+        if not self.override_active:
+            self.serve_next_emergency_if_any()
+
+    def get_next_emergency(self) -> Optional[Dict]:
         if not self.emergency_queue:
             return None
+        # Priority: ambulance first, then firetruck
+        sorted_q = sorted(self.emergency_queue, key=lambda e: (0 if e["type"]=="ambulance" else 1, e["time"]))
+        return sorted_q[0]
+
+    def serve_next_emergency_if_any(self):
+        next_em = self.get_next_emergency()
+        if next_em:
+            try:
+                self.emergency_queue.remove(next_em)
+            except ValueError:
+                pass
             
-        # Sort by priority (ambulance > firetruck) and arrival time
-        sorted_queue = sorted(self.emergency_queue, 
-                            key=lambda x: (0 if x["type"] == "ambulance" else 1, x["time"]))
-        return sorted_queue[0]
-    
-    def serve_emergency(self, emergency):
-        """Activate emergency override"""
-        if emergency in self.emergency_queue:
-            self.emergency_queue.remove(emergency)
-        
-        self.override_active = True
-        self.override_direction = emergency["direction"]
-        self.override_timer = EMERGENCY_TIME
-        
-        # Set appropriate signals green
-        if self.override_direction in ("north", "south"):
+            self.override_active = True
+            self.override_direction = next_em["direction"]
+            self.override_timer = EMERGENCY_HOLD
+            
+            # Apply emergency signals
+            self.apply_emergency_signals(self.override_direction)
+            
+            self.ui.update_signals(self.signals, override=True)
+            self.ui.set_status(f"EMERGENCY ACTIVE: {next_em['type'].upper()} from {next_em['direction'].upper()}")
+            self.ui.log_event(f"Serving emergency: {next_em['type'].upper()} from {next_em['direction'].upper()}")
+            
+            # Log response time
+            response_time = time.time() - next_em["time"]
+            self.statistics.log_emergency(next_em["type"], next_em["direction"], response_time)
+
+    def apply_emergency_signals(self, direction: str):
+        if direction in ("north", "south"):
             self.signals.update({"north": "green", "south": "green", "east": "red", "west": "red"})
         else:
             self.signals.update({"east": "green", "west": "green", "north": "red", "south": "red"})
-        
-        self.ui.update_signals(self.signals, override=True)
-        self.ui.log_event(f"Emergency active: {emergency['type'].upper()} from {emergency['direction'].upper()}")
-    
+
     def end_override(self):
-        """End emergency override"""
         self.override_active = False
         self.override_direction = None
-        self.override_timer = 0
+        self.override_timer = 0.0
         
-        # Remove all served emergencies for the direction
-        if self.override_direction:
-            self.emergency_queue = deque(
-                e for e in self.emergency_queue 
-                if e["direction"] != self.override_direction
-            )
-        
-        # Return to normal cycle
+        if self.get_next_emergency():
+            self.serve_next_emergency_if_any()
+            return
+            
         self.set_ns_green()
-        self.ui.log_event("Emergency override ended")
-    
+        self.ui.log_event("Emergency override ended; returning to normal cycle")
+
+    def auto_green_for_approaching(self):
+        cx, cy = CANVAS_W/2, CANVAS_H/2
+        
+        for v in self.ui.vehicle_manager.vehicles:
+            if v.vehicle_type in ("ambulance", "firetruck"):
+                dist = math.sqrt((v.x - cx)**2 + (v.y - cy)**2)
+                
+                if dist < AUTO_GREEN_DIST and not self.override_active:
+                    self.override_active = True
+                    self.override_direction = v.direction
+                    self.override_timer = EMERGENCY_HOLD
+                    self.apply_emergency_signals(v.direction)
+                    self.ui.update_signals(self.signals, override=True)
+                    self.ui.set_status(f"AUTO-GREEN: {v.vehicle_type.upper()} approaching")
+                    self.ui.log_event(f"Auto-green triggered for {v.vehicle_type.upper()} from {v.direction.upper()}")
+                    return
+
     def set_ns_green(self):
         self.cycle_state = "ns_green"
         self.state_timer = GREEN_TIME
         self.signals.update({"north": "green", "south": "green", "east": "red", "west": "red"})
         self.ui.update_signals(self.signals)
         self.ui.set_status("Normal: North-South GREEN")
-        self.ui.update_timer(self.state_timer)
-    
+
     def set_ns_yellow(self):
         self.cycle_state = "ns_yellow"
         self.state_timer = YELLOW_TIME
         self.signals.update({"north": "yellow", "south": "yellow", "east": "red", "west": "red"})
         self.ui.update_signals(self.signals)
         self.ui.set_status("North-South YELLOW")
-        self.ui.update_timer(self.state_timer)
-    
+
     def set_ew_green(self):
         self.cycle_state = "ew_green"
         self.state_timer = GREEN_TIME
         self.signals.update({"east": "green", "west": "green", "north": "red", "south": "red"})
         self.ui.update_signals(self.signals)
         self.ui.set_status("Normal: East-West GREEN")
-        self.ui.update_timer(self.state_timer)
-    
+
     def set_ew_yellow(self):
         self.cycle_state = "ew_yellow"
         self.state_timer = YELLOW_TIME
         self.signals.update({"east": "yellow", "west": "yellow", "north": "red", "south": "red"})
         self.ui.update_signals(self.signals)
         self.ui.set_status("East-West YELLOW")
-        self.ui.update_timer(self.state_timer)
-    
+
     def _tick(self):
         if not self.running:
             return
-        
+
+        # Emergency handling
+        self.auto_green_for_approaching()
+
         if self.override_active:
-            # Handle emergency override
             self.override_timer -= CHECK_INTERVAL / 1000.0
-            self.ui.update_timer(max(0, int(self.override_timer)))
+            self.ui.update_timer(int(math.ceil(self.override_timer)))
             
             if self.override_timer <= 0:
                 self.end_override()
         else:
-            # Check for emergencies
-            emergency = self.get_next_emergency()
-            if emergency:
-                self.serve_emergency(emergency)
-            else:
-                # Normal cycle
-                self.state_timer -= CHECK_INTERVAL / 1000.0
-                
-                if self.state_timer <= 0:
-                    # Transition to next state
-                    if self.cycle_state == "ns_green":
-                        self.set_ns_yellow()
-                    elif self.cycle_state == "ns_yellow":
-                        self.set_ew_green()
-                    elif self.cycle_state == "ew_green":
-                        self.set_ew_yellow()
-                    elif self.cycle_state == "ew_yellow":
-                        self.set_ns_green()
-                else:
-                    self.ui.update_timer(max(0, int(self.state_timer)))
-        
-        # Schedule next tick
+            self.state_timer -= CHECK_INTERVAL / 1000.0
+            self.ui.update_timer(max(0, int(math.ceil(self.state_timer))))
+            
+            if self.state_timer <= 0:
+                if self.cycle_state == "ns_green":
+                    self.set_ns_yellow()
+                elif self.cycle_state == "ns_yellow":
+                    self.set_ew_green()
+                elif self.cycle_state == "ew_green":
+                    self.set_ew_yellow()
+                elif self.cycle_state == "ew_yellow":
+                    self.set_ns_green()
+
         self.ui.root.after(CHECK_INTERVAL, self._tick)
 
 # -------------------------
-# Vehicle Manager
+# VehicleManager
 # -------------------------
 class VehicleManager:
     def __init__(self, ui, canvas):
         self.ui = ui
         self.canvas = canvas
-        self.vehicles = []
+        self.vehicles: List['Vehicle'] = []
         self.vehicle_count = 0
-        self.spawn_timer = None
         
-        # Spawn points for each direction
         self.spawn_points = {
             "north": (CANVAS_W/2 - 60, -VEHICLE_SPAWN_DIST),
             "south": (CANVAS_W/2 + 60, CANVAS_H + VEHICLE_SPAWN_DIST),
             "west": (-VEHICLE_SPAWN_DIST, CANVAS_H/2 - 40),
             "east": (CANVAS_W + VEHICLE_SPAWN_DIST, CANVAS_H/2 + 40)
         }
-        
-        # Velocity vectors
-        self.velocities = {
-            "north": (0, 1),
-            "south": (0, -1),
-            "west": (1, 0),
-            "east": (-1, 0)
-        }
-        
-        # Despawn boundaries
-        self.despawn_bounds = {
-            "north": lambda y: y > CANVAS_H + VEHICLE_DESPAWN_DIST,
-            "south": lambda y: y < -VEHICLE_DESPAWN_DIST,
-            "west": lambda x: x > CANVAS_W + VEHICLE_DESPAWN_DIST,
-            "east": lambda x: x < -VEHICLE_DESPAWN_DIST
-        }
-    
-    def spawn_vehicle(self, direction: Optional[str] = None, vehicle_type: str = "car"):
-        """Spawn a new vehicle"""
+
+        self.velocities = {"north": (0,1), "south": (0,-1), "west": (1,0), "east": (-1,0)}
+
+    def spawn_vehicle(self, direction: Optional[str]=None, vehicle_type: str="car") -> bool:
         if direction is None:
             direction = random.choice(list(self.spawn_points.keys()))
-        
-        # Check spacing to avoid collisions
         if not self.can_spawn_at(direction):
             return False
-        
-        # Create vehicle
-        vehicle = Vehicle(
-            self.ui, self.canvas, direction, vehicle_type,
-            self.velocities[direction], self.spawn_points[direction]
-        )
-        
-        self.vehicles.append(vehicle)
+        v = Vehicle(self.ui, self.canvas, direction, vehicle_type, self.velocities[direction], self.spawn_points[direction])
+        self.vehicles.append(v)
         self.vehicle_count += 1
         self.ui.total_var.set(self.vehicle_count)
         
-        # Play appropriate sound
-        if vehicle_type == "car":
-            threading.Thread(target=lambda: self.ui.audio.play_sound("car_horn"), daemon=True).start()
-        elif vehicle_type == "ambulance":
-            vehicle.sound_channel = self.ui.audio.play_sound("ambulance_siren", loop=True)
-        elif vehicle_type == "firetruck":
-            vehicle.sound_channel = self.ui.audio.play_sound("firetruck_siren", loop=True)
-        
+        # Update statistics
+        self.ui.controller.statistics.log_vehicle(vehicle_type)
         return True
-    
+
     def can_spawn_at(self, direction: str) -> bool:
-        """Check if there's enough space to spawn a vehicle"""
-        spawn_x, spawn_y = self.spawn_points[direction]
-        
-        for vehicle in self.vehicles:
-            if vehicle.direction == direction:
-                # Calculate distance from spawn point
-                dx = abs(vehicle.x - spawn_x)
-                dy = abs(vehicle.y - spawn_y)
-                distance = math.sqrt(dx*dx + dy*dy)
-                
-                if distance < MIN_SPACING:
+        sx, sy = self.spawn_points[direction]
+        for v in self.vehicles:
+            if v.direction == direction:
+                if abs(v.x - sx) + abs(v.y - sy) < MIN_SPACING:
                     return False
-        
         return True
-    
-    def update_vehicles(self, signals: Dict, speed_multiplier: float):
-        """Update all vehicles"""
-        for vehicle in self.vehicles[:]:  # Use slice to copy list
-            # Check traffic signals
-            vehicle.check_stop_signal(signals)
-            
-            # Update position if not stopped
-            if not vehicle.stopped:
-                vehicle.move(speed_multiplier)
-            
-            # Update siren blinking for emergency vehicles
-            if vehicle.vehicle_type in ("ambulance", "firetruck"):
-                vehicle.update_siren()
-            
-            # Check if vehicle should be despawned
-            if self.should_despawn(vehicle):
-                self.remove_vehicle(vehicle)
-    
-    def should_despawn(self, vehicle) -> bool:
-        """Check if vehicle is out of bounds"""
-        check_bound = self.despawn_bounds.get(vehicle.direction)
-        if check_bound:
-            return check_bound(vehicle.x) or check_bound(vehicle.y)
-        return False
-    
-    def remove_vehicle(self, vehicle):
-        """Remove vehicle from simulation"""
-        if vehicle in self.vehicles:
-            # Stop any playing sounds
-            if vehicle.sound_channel:
-                self.ui.audio.stop_sound(vehicle.sound_channel)
-            
-            # Update stats if emergency vehicle made it through
-            if (vehicle.vehicle_type in ("ambulance", "firetruck") and 
-                vehicle.has_passed_intersection):
-                if vehicle.vehicle_type == "ambulance":
-                    self.ui.amb_served_var.set(self.ui.amb_served_var.get() + 1)
+
+    def update_vehicles(self, signals: Dict[str,str], speed_multiplier: float):
+        for v in self.vehicles[:]:
+            v.check_stop_signal(signals)
+            if not v.stopped:
+                v.move(speed_multiplier)
+            if v.vehicle_type in ("ambulance", "firetruck"):
+                v.update_siren()
+            if self.should_despawn(v):
+                self.remove_vehicle(v)
+
+    def should_despawn(self, v: 'Vehicle') -> bool:
+        if v.direction in ("north","south"):
+            return v.y > CANVAS_H + VEHICLE_DESPAWN_DIST or v.y < -VEHICLE_DESPAWN_DIST
+        else:
+            return v.x > CANVAS_W + VEHICLE_DESPAWN_DIST or v.x < -VEHICLE_DESPAWN_DIST
+
+    def remove_vehicle(self, v: 'Vehicle'):
+        if v in self.vehicles:
+            if v.vehicle_type in ("ambulance","firetruck") and v.has_passed_intersection:
+                if v.vehicle_type == "ambulance":
+                    self.ui.amb_served_var.set(self.ui.amb_served_var.get()+1)
                 else:
-                    self.ui.fire_served_var.set(self.ui.fire_served_var.get() + 1)
-            
-            # Remove from canvas
-            vehicle.destroy()
-            
-            # Remove from list
-            self.vehicles.remove(vehicle)
-    
+                    self.ui.fire_served_var.set(self.ui.fire_served_var.get()+1)
+                    
+                # Update statistics
+                wait_time = time.time() - v.spawn_time if hasattr(v, 'spawn_time') else 0
+                self.ui.controller.statistics.log_vehicle(v.vehicle_type, passed=True, wait_time=wait_time)
+                
+            v.destroy()
+            self.vehicles.remove(v)
+            self.vehicle_count -= 1
+            self.ui.total_var.set(self.vehicle_count)
+
     def clear_all(self):
-        """Remove all vehicles"""
-        for vehicle in self.vehicles[:]:
-            self.remove_vehicle(vehicle)
+        for v in self.vehicles[:]:
+            v.destroy()
         self.vehicles.clear()
+        self.vehicle_count = 0
+        self.ui.total_var.set(0)
 
 # -------------------------
-# Vehicle Class
+# Vehicle class with IMAGES
 # -------------------------
 class Vehicle:
     id_counter = 0
+    vehicle_images = {}  # Cache for vehicle images
     
     def __init__(self, ui, canvas, direction, vehicle_type, velocity, spawn_point):
         self.ui = ui
         self.canvas = canvas
         self.direction = direction
         self.vehicle_type = vehicle_type
-        self.id = Vehicle.id_counter
-        Vehicle.id_counter += 1
-        
-        # Position and movement
-        self.x, self.y = spawn_point
         self.vx, self.vy = velocity
-        self.base_speed = self._get_base_speed()
+        self.x, self.y = spawn_point
+        
+        # Set speed based on vehicle type
+        if vehicle_type == "ambulance":
+            self.base_speed = AMB_BASE_SPEED
+        elif vehicle_type == "firetruck":
+            self.base_speed = FIRE_BASE_SPEED
+        else:
+            self.base_speed = CAR_BASE_SPEED
+            
         self.speed = self.base_speed
         self.stopped = False
         self.has_passed_intersection = False
+        self.spawn_time = time.time()
         
-        # Visual properties
-        self.color = self._get_color()
-        self.siren_color = self._get_siren_color() if vehicle_type in ("ambulance", "firetruck") else None
-        self.width, self.height = self._get_dimensions()
-        
-        # Canvas items
         self.canvas_id = None
         self.siren_id = None
-        self.glow_id = None
-        self.tk_image = None
+        self.blink_counter = 0
+        self.tk_image = None  # Keep reference to prevent garbage collection
         
-        # Sound
-        self.sound_channel = None
-        
-        # Siren animation
-        self.blink_state = False
-        self.blink_timer = 0
-        
-        # Create visual representation
-        self.create_on_canvas()
-    
-    def _get_base_speed(self):
-        speeds = {
-            "car": CAR_BASE_SPEED,
-            "ambulance": AMB_BASE_SPEED,
-            "firetruck": FIRE_BASE_SPEED
-        }
-        return speeds.get(self.vehicle_type, CAR_BASE_SPEED)
-    
-    def _get_color(self):
-        if self.vehicle_type == "ambulance":
-            return "#ffffff"
-        elif self.vehicle_type == "firetruck":
-            return "#ff6b00"
-        else:
-            return random.choice(["#2E86C1", "#1E8449", "#7D3C98", "#F39C12", "#E74C3C"])
-    
-    def _get_siren_color(self):
-        return "#ff0055" if self.vehicle_type == "ambulance" else "#ffcc00"
-    
-    def _get_dimensions(self):
-        if self.direction in ("north", "south"):
-            return 28, 16
-        else:
-            return 16, 28
-    
-    def create_on_canvas(self):
-        """Create vehicle visual on canvas using sprite images"""
+        Vehicle.id_counter += 1
+        self.create_visual()
+
+    def create_visual(self):
         try:
-            # Load correct image based on vehicle type
-            if self.vehicle_type == "ambulance":
-                img = Image.open("assets/ambulance.png")
-            elif self.vehicle_type == "firetruck":
-                img = Image.open("assets/firetruck.png")
+            # Load and resize image based on vehicle type
+            if self.vehicle_type == "ambulance" and os.path.exists("assets/ambulance.png"):
+                img_path = "assets/ambulance.png"
+                size = (40, 80)
+            elif self.vehicle_type == "firetruck" and os.path.exists("assets/firetruck.png"):
+                img_path = "assets/firetruck.png"
+                size = (45, 85)
+            elif os.path.exists("assets/car_blue.png"):
+                # Randomly choose car color if available
+                car_files = ["car_blue.png", "car_red.png", "car_green.png", "car_yellow.png"]
+                available_files = [f for f in car_files if os.path.exists(f"assets/{f}")]
+                if available_files:
+                    img_path = f"assets/{random.choice(available_files)}"
+                    size = (35, 70)
+                else:
+                    raise FileNotFoundError("No car images found")
             else:
-                # Use car sprites
-                img_name = random.choice([
-                    "car_green.png",
-                    "car_red.png",
-                    "car_yellow.png",
-                    "car_blue.png"
-                ])
-                img = Image.open("assets/" + img_name)
-
-            # Resize for simulation scale (smaller than original specification for better fitting)
-            img = img.resize((50, 100), Image.Resampling.LANCZOS)
-
-            # Rotate image depending on direction
-            angle = {
-                "north": 0,
-                "south": 180,
-                "east": 270,
-                "west": 90
-            }[self.direction]
-
-            img = img.rotate(angle, expand=True)
-
-            # Convert to Tkinter image
-            self.tk_image = ImageTk.PhotoImage(img)
-
-            # Draw sprite on canvas
-            self.canvas_id = self.canvas.create_image(self.x, self.y, image=self.tk_image, tags="vehicle")
+                raise FileNotFoundError("Image not found")
             
-            # Add siren indicator for emergency vehicles
-            if self.siren_color:
-                self.create_siren_indicator()
+            # Load and process image
+            img = Image.open(img_path)
+            img = img.resize(size, Image.Resampling.LANCZOS)
+            
+            # Rotate based on direction
+            if self.direction == "north":
+                angle = 0
+            elif self.direction == "south":
+                angle = 180
+            elif self.direction == "east":
+                angle = 270
+            else:  # west
+                angle = 90
                 
+            img = img.rotate(angle, expand=True)
+            
+            # Convert to PhotoImage
+            self.tk_image = ImageTk.PhotoImage(img)
+            self.canvas_id = self.canvas.create_image(self.x, self.y, image=self.tk_image)
+            
         except Exception as e:
-            print(f"Error loading sprite: {e}")
-            # Fallback to rectangle if sprite loading fails
-            self.create_fallback_visual()
-    
-    def create_fallback_visual(self):
-        """Create fallback rectangle visual if sprite loading fails"""
-        x1, y1 = self.x - self.width/2, self.y - self.height/2
-        x2, y2 = self.x + self.width/2, self.y + self.height/2
-        self.canvas_id = self.canvas.create_rectangle(
-            x1, y1, x2, y2, fill=self.color, outline="#111", width=1, tags="vehicle"
-        )
+            # Fallback to rectangle if image loading fails
+            print(f"Failed to load image: {e}. Using fallback rectangle.")
+            color = "white" if self.vehicle_type == "ambulance" else "orange" if self.vehicle_type == "firetruck" else "blue"
+            w, h = (28, 16) if self.direction in ("east", "west") else (16, 28)
+            self.canvas_id = self.canvas.create_rectangle(
+                self.x - w/2, self.y - h/2, 
+                self.x + w/2, self.y + h/2, 
+                fill=color, outline="black", width=1
+            )
         
-        # Add siren for emergency vehicles
-        if self.siren_color:
-            self.create_siren_indicator()
-    
-    def create_siren_indicator(self):
-        """Create siren light indicator for emergency vehicles"""
-        # Calculate siren position based on vehicle direction and type
-        if self.vehicle_type == "ambulance":
-            # Ambulance siren on top
-            siren_x, siren_y = self.x, self.y - 35
-            siren_size = 8
-        elif self.vehicle_type == "firetruck":
-            # Firetruck siren on top
-            siren_x, siren_y = self.x, self.y - 40
-            siren_size = 10
-        else:
-            return
-            
-        # Create siren light
-        self.siren_id = self.canvas.create_oval(
-            siren_x - siren_size, siren_y - siren_size,
-            siren_x + siren_size, siren_y + siren_size,
-            fill=self.siren_color, outline="black", width=1, tags="siren"
-        )
-        
-        # Create glow effect
-        glow_size = siren_size + 8
-        self.glow_id = self.canvas.create_oval(
-            siren_x - glow_size, siren_y - glow_size,
-            siren_x + glow_size, siren_y + glow_size,
-            fill=self.siren_color, outline="", stipple="gray50",
-            state="hidden", tags="glow"
-        )
-    
+        # Siren indicator for emergency vehicles
+        if self.vehicle_type in ("ambulance", "firetruck"):
+            sx, sy = self.x, self.y - 25
+            self.siren_id = self.canvas.create_oval(
+                sx - 6, sy - 6, sx + 6, sy + 6, 
+                fill="red", outline="yellow", width=1
+            )
+
     def move(self, speed_multiplier: float):
-        """Move the vehicle"""
-        move_x = self.vx * self.speed * speed_multiplier
-        move_y = self.vy * self.speed * speed_multiplier
+        dx = self.vx * self.speed * speed_multiplier
+        dy = self.vy * self.speed * speed_multiplier
+        self.x += dx
+        self.y += dy
         
-        # Update position
-        self.x += move_x
-        self.y += move_y
-        
-        # Move canvas items
+        # Move vehicle
         if self.canvas_id:
-            self.canvas.move(self.canvas_id, move_x, move_y)
+            self.canvas.move(self.canvas_id, dx, dy)
         if self.siren_id:
-            self.canvas.move(self.siren_id, move_x, move_y)
-        if self.glow_id:
-            self.canvas.move(self.glow_id, move_x, move_y)
-    
-    def check_stop_signal(self, signals):
-        """Check if vehicle should stop at intersection"""
-        center_x, center_y = CANVAS_W/2, CANVAS_H/2
-        
-        # Calculate distance to intersection
+            self.canvas.move(self.siren_id, dx, dy)
+
+        # Mark passed intersection
+        cx, cy = CANVAS_W/2, CANVAS_H/2
+        if not self.has_passed_intersection:
+            if self.direction == "north" and self.y > cy + 30: 
+                self.has_passed_intersection = True
+            if self.direction == "south" and self.y < cy - 30: 
+                self.has_passed_intersection = True
+            if self.direction == "west" and self.x > cx + 30: 
+                self.has_passed_intersection = True
+            if self.direction == "east" and self.x < cx - 30: 
+                self.has_passed_intersection = True
+
+    def check_stop_signal(self, signals: Dict[str,str]):
+        # Emergency vehicles ignore signals
+        if self.vehicle_type in ("ambulance", "firetruck"):
+            self.stopped = False
+            return
+
+        cx, cy = CANVAS_W/2, CANVAS_H/2
         if self.direction == "north":
-            distance_to_center = center_y - self.y
-            should_stop = distance_to_center < STOP_DIST and distance_to_center > -STOP_DIST
-            if should_stop:
-                self.stopped = signals["north"] != "green"
-            else:
-                self.stopped = False
-                if self.y > center_y + STOP_DIST:
-                    self.has_passed_intersection = True
-        
+            dist = cy - self.y
+            if dist < STOP_DIST and signals["north"] != "green":
+                self.stopped = True
+                return
         elif self.direction == "south":
-            distance_to_center = self.y - center_y
-            should_stop = distance_to_center < STOP_DIST and distance_to_center > -STOP_DIST
-            if should_stop:
-                self.stopped = signals["south"] != "green"
-            else:
-                self.stopped = False
-                if self.y < center_y - STOP_DIST:
-                    self.has_passed_intersection = True
-        
+            dist = self.y - cy
+            if dist < STOP_DIST and signals["south"] != "green":
+                self.stopped = True
+                return
         elif self.direction == "west":
-            distance_to_center = center_x - self.x
-            should_stop = distance_to_center < STOP_DIST and distance_to_center > -STOP_DIST
-            if should_stop:
-                self.stopped = signals["west"] != "green"
-            else:
-                self.stopped = False
-                if self.x > center_x + STOP_DIST:
-                    self.has_passed_intersection = True
-        
+            dist = cx - self.x
+            if dist < STOP_DIST and signals["west"] != "green":
+                self.stopped = True
+                return
         elif self.direction == "east":
-            distance_to_center = self.x - center_x
-            should_stop = distance_to_center < STOP_DIST and distance_to_center > -STOP_DIST
-            if should_stop:
-                self.stopped = signals["east"] != "green"
-            else:
-                self.stopped = False
-                if self.x < center_x - STOP_DIST:
-                    self.has_passed_intersection = True
-    
+            dist = self.x - cx
+            if dist < STOP_DIST and signals["east"] != "green":
+                self.stopped = True
+                return
+
+        self.stopped = False
+
     def update_siren(self):
-        """Update siren blinking effect"""
-        self.blink_timer += 1
-        if self.blink_timer >= 10:  # Blink every 10 frames
-            self.blink_timer = 0
-            self.blink_state = not self.blink_state
-            
-            if self.siren_id:
-                self.canvas.itemconfig(self.siren_id, state="normal" if self.blink_state else "hidden")
-            
-            # Show glow when siren is on
-            if self.glow_id:
-                self.canvas.itemconfig(self.glow_id, state="normal" if self.blink_state else "hidden")
-    
+        if not self.siren_id:
+            return
+        self.blink_counter = (self.blink_counter + 1) % 20
+        color = "red" if self.blink_counter < 10 else "blue"
+        self.canvas.itemconfig(self.siren_id, fill=color)
+
     def destroy(self):
-        """Remove vehicle from canvas"""
-        items = [self.canvas_id, self.siren_id, self.glow_id]
-        for item in items:
-            if item:
-                try:
-                    self.canvas.delete(item)
-                except:
-                    pass
+        if self.canvas_id:
+            self.canvas.delete(self.canvas_id)
+        if self.siren_id:
+            self.canvas.delete(self.siren_id)
 
 # -------------------------
-# Main UI
+# TrafficUI
 # -------------------------
 class TrafficUI:
     def __init__(self, root):
         self.root = root
-        root.title("Advanced Traffic Simulation - Continuous Flow")
+        root.title("Emergency Priority Traffic Simulation")
         root.geometry(f"{CANVAS_W + 320}x{CANVAS_H + 20}")
         root.resizable(False, False)
-        
-        # Initialize components
-        self.audio = AudioManager()
-        
-        # Create main canvas
+
+        # Canvas
         self.canvas = tk.Canvas(root, width=CANVAS_W, height=CANVAS_H, bg=BG_COLOR, highlightthickness=0)
         self.canvas.place(x=0, y=0)
-        
-        # Create control panel
-        self.panel = tk.Frame(root, width=300, height=CANVAS_H, bg=PANEL_BG, relief="ridge")
+
+        # Panel
+        self.panel = tk.Frame(root, width=300, height=CANVAS_H, bg=PANEL_BG)
         self.panel.place(x=CANVAS_W + 10, y=10)
-        
-        # Initialize managers
+
+        # Managers
         self.vehicle_manager = VehicleManager(self, self.canvas)
         self.controller = TrafficController(self)
-        
-        # Setup UI
+
+        # UI variables
+        self.is_running = False
+        self.animation_id = None
+        self.spawn_id = None
+
+        # Stats
+        self.total_var = tk.IntVar(value=0)
+        self.amb_served_var = tk.IntVar(value=0)
+        self.fire_served_var = tk.IntVar(value=0)
+        self.timer_var = tk.StringVar(value="Timer: 0s")
+        self.status_var = tk.StringVar(value="Ready - Click Start")
+
+        # Queue visualization
+        self.queue_visualizations = {
+            "north": {"canvas": None, "items": [], "count": 0},
+            "south": {"canvas": None, "items": [], "count": 0},
+            "east": {"canvas": None, "items": [], "count": 0},
+            "west": {"canvas": None, "items": [], "count": 0}
+        }
+
+        # Controls
         self.setup_ui()
         self.draw_intersection()
         self.create_traffic_lights()
-        
-        # Animation variables
-        self.animation_id = None
-        self.spawn_id = None
-        self.is_running = False
-        
-        # Start with stopped state
-        self.set_status("Ready - Click Start")
-    
+
     def setup_ui(self):
-        """Setup control panel UI"""
-        # Status display
-        self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(self.panel, text="Status:", background=PANEL_BG, 
-                 font=("Arial", 10, "bold")).place(x=12, y=10)
-        self.status_label = ttk.Label(self.panel, textvariable=self.status_var, 
-                                     background=PANEL_BG, wraplength=270)
-        self.status_label.place(x=12, y=32)
-        
-        # Timer display
-        self.timer_var = tk.StringVar(value="Timer: 0s")
-        ttk.Label(self.panel, textvariable=self.timer_var, background=PANEL_BG,
-                 font=("Arial", 9, "bold")).place(x=180, y=10)
-        
-        # Control buttons
-        ttk.Button(self.panel, text="Start", command=self.start_simulation).place(x=12, y=62, width=80)
-        ttk.Button(self.panel, text="Stop", command=self.stop_simulation).place(x=102, y=62, width=80)
-        ttk.Button(self.panel, text="Reset", command=self.reset_simulation).place(x=192, y=62, width=90)
-        
-        # Spawn controls
-        ttk.Label(self.panel, text="Spawn Rate (ms):", background=PANEL_BG).place(x=12, y=100)
+        ttk.Label(self.panel, text="Status:", background=PANEL_BG, font=("Arial",10,"bold")).place(x=12,y=8)
+        ttk.Label(self.panel, textvariable=self.status_var, background=PANEL_BG, wraplength=270).place(x=12,y=30)
+        ttk.Label(self.panel, textvariable=self.timer_var, background=PANEL_BG).place(x=180,y=10)
+
+        ttk.Button(self.panel, text="Start", command=self.start_simulation).place(x=12,y=62,width=80)
+        ttk.Button(self.panel, text="Stop", command=self.stop_simulation).place(x=102,y=62,width=80)
+        ttk.Button(self.panel, text="Reset", command=self.reset_simulation).place(x=192,y=62,width=90)
+
+        ttk.Label(self.panel, text="Spawn Rate (ms):", background=PANEL_BG).place(x=12,y=100)
         self.spawn_rate_var = tk.IntVar(value=1800)
-        self.spawn_slider = ttk.Scale(self.panel, from_=400, to=5000, 
-                                     orient="horizontal", variable=self.spawn_rate_var)
-        self.spawn_slider.place(x=12, y=120, width=270)
-        
-        # Speed controls
-        ttk.Label(self.panel, text="Speed Multiplier:", background=PANEL_BG).place(x=12, y=150)
+        ttk.Scale(self.panel, from_=400, to=5000, orient="horizontal", variable=self.spawn_rate_var).place(x=12,y=120,width=270)
+
+        ttk.Label(self.panel, text="Speed Multiplier:", background=PANEL_BG).place(x=12,y=150)
         self.speed_var = tk.DoubleVar(value=1.0)
-        self.speed_slider = ttk.Scale(self.panel, from_=0.4, to=2.0,
-                                     orient="horizontal", variable=self.speed_var)
-        self.speed_slider.place(x=12, y=170, width=270)
-        
-        # Statistics
-        self.setup_statistics()
-        
-        # Emergency spawn buttons
-        self.setup_emergency_controls()
-        
-        # Event log
-        self.setup_event_log()
-    
-    def setup_statistics(self):
-        """Setup statistics display"""
-        ttk.Label(self.panel, text="Statistics:", background=PANEL_BG,
-                 font=("Arial", 10, "bold")).place(x=12, y=210)
-        
-        # Total vehicles
-        self.total_var = tk.IntVar(value=0)
-        ttk.Label(self.panel, text="Total Vehicles:", background=PANEL_BG).place(x=12, y=236)
-        ttk.Label(self.panel, textvariable=self.total_var, background=PANEL_BG).place(x=200, y=236)
-        
-        # Ambulances served
-        self.amb_served_var = tk.IntVar(value=0)
-        ttk.Label(self.panel, text="Ambulances:", background=PANEL_BG).place(x=12, y=262)
-        ttk.Label(self.panel, textvariable=self.amb_served_var, background=PANEL_BG).place(x=200, y=262)
-        
-        # Firetrucks served
-        self.fire_served_var = tk.IntVar(value=0)
-        ttk.Label(self.panel, text="Firetrucks:", background=PANEL_BG).place(x=12, y=288)
-        ttk.Label(self.panel, textvariable=self.fire_served_var, background=PANEL_BG).place(x=200, y=288)
-    
-    def setup_emergency_controls(self):
-        """Setup emergency vehicle spawn buttons"""
+        ttk.Scale(self.panel, from_=0.4, to=2.0, orient="horizontal", variable=self.speed_var).place(x=12,y=170,width=270)
+
+        # Stats
+        ttk.Label(self.panel, text="Statistics:", background=PANEL_BG, font=("Arial",10,"bold")).place(x=12,y=210)
+        ttk.Label(self.panel, text="Total Vehicles:", background=PANEL_BG).place(x=12,y=236)
+        ttk.Label(self.panel, textvariable=self.total_var, background=PANEL_BG).place(x=200,y=236)
+        ttk.Label(self.panel, text="Ambulances Served:", background=PANEL_BG).place(x=12,y=262)
+        ttk.Label(self.panel, textvariable=self.amb_served_var, background=PANEL_BG).place(x=200,y=262)
+        ttk.Label(self.panel, text="Firetrucks Served:", background=PANEL_BG).place(x=12,y=288)
+        ttk.Label(self.panel, textvariable=self.fire_served_var, background=PANEL_BG).place(x=200,y=288)
+
+        # Emergency buttons
         y_base = 330
-        ttk.Label(self.panel, text="Spawn Emergency:", background=PANEL_BG,
-                 font=("Arial", 10, "bold")).place(x=12, y=y_base)
+        ttk.Label(self.panel, text="Spawn Emergency:", background=PANEL_BG, font=("Arial",10,"bold")).place(x=12,y=y_base)
+        directions = [("N","north"),("S","south"),("E","east"),("W","west")]
+        for i,(lbl,dirc) in enumerate(directions):
+            ttk.Button(self.panel, text=f"Amb {lbl}", command=lambda d=dirc: self.spawn_emergency_vehicle(d,"ambulance")).place(x=12+i*70,y=y_base+26,width=60)
+        for i,(lbl,dirc) in enumerate(directions):
+            ttk.Button(self.panel, text=f"Fire {lbl}", command=lambda d=dirc: self.spawn_emergency_vehicle(d,"firetruck")).place(x=12+i*70,y=y_base+60,width=60)
         
-        # Ambulance buttons
-        directions = [("N", "north"), ("S", "south"), ("E", "east"), ("W", "west")]
-        for i, (label, direction) in enumerate(directions):
-            x_pos = 12 + (i * 70)
-            ttk.Button(self.panel, text=f"Amb {label}",
-                      command=lambda d=direction: self.spawn_emergency_vehicle(d, "ambulance")
-                      ).place(x=x_pos, y=y_base + 26, width=60)
-        
-        # Firetruck buttons
-        for i, (label, direction) in enumerate(directions):
-            x_pos = 12 + (i * 70)
-            ttk.Button(self.panel, text=f"Fire {label}",
-                      command=lambda d=direction: self.spawn_emergency_vehicle(d, "firetruck")
-                      ).place(x=x_pos, y=y_base + 60, width=60)
-    
-    def setup_event_log(self):
-        """Setup event log display"""
+        # Queue Visualization
         y_base = 420
-        ttk.Label(self.panel, text="Event Log:", background=PANEL_BG,
-                 font=("Arial", 10, "bold")).place(x=12, y=y_base)
+        ttk.Label(self.panel, text="Queue Visualization:", background=PANEL_BG, font=("Arial",10,"bold")).place(x=12,y=y_base)
         
-        # Create log listbox with scrollbar
+        # Create queue visualization frames for each direction
+        queue_frame = tk.Frame(self.panel, bg=PANEL_BG, relief=tk.RIDGE, borderwidth=1)
+        queue_frame.place(x=12, y=y_base+25, width=270, height=100)
+        
+        # North queue
+        north_label = ttk.Label(queue_frame, text="North:", background=PANEL_BG)
+        north_label.place(x=5, y=5)
+        north_queue_canvas = tk.Canvas(queue_frame, width=250, height=20, bg=PANEL_BG, highlightthickness=0)
+        north_queue_canvas.place(x=50, y=5)
+        self.queue_visualizations["north"]["canvas"] = north_queue_canvas
+        
+        # South queue
+        south_label = ttk.Label(queue_frame, text="South:", background=PANEL_BG)
+        south_label.place(x=5, y=30)
+        south_queue_canvas = tk.Canvas(queue_frame, width=250, height=20, bg=PANEL_BG, highlightthickness=0)
+        south_queue_canvas.place(x=50, y=30)
+        self.queue_visualizations["south"]["canvas"] = south_queue_canvas
+        
+        # West queue
+        west_label = ttk.Label(queue_frame, text="West:", background=PANEL_BG)
+        west_label.place(x=5, y=55)
+        west_queue_canvas = tk.Canvas(queue_frame, width=250, height=20, bg=PANEL_BG, highlightthickness=0)
+        west_queue_canvas.place(x=50, y=55)
+        self.queue_visualizations["west"]["canvas"] = west_queue_canvas
+        
+        # East queue
+        east_label = ttk.Label(queue_frame, text="East:", background=PANEL_BG)
+        east_label.place(x=5, y=80)
+        east_queue_canvas = tk.Canvas(queue_frame, width=250, height=20, bg=PANEL_BG, highlightthickness=0)
+        east_queue_canvas.place(x=50, y=80)
+        self.queue_visualizations["east"]["canvas"] = east_queue_canvas
+        
+        # Move event log down
+        y_base = 525
+        ttk.Label(self.panel, text="Event Log:", background=PANEL_BG, font=("Arial",10,"bold")).place(x=12,y=y_base)
         log_frame = tk.Frame(self.panel, bg=PANEL_BG)
-        log_frame.place(x=12, y=y_base + 26, width=270, height=150)
-        
-        scrollbar = ttk.Scrollbar(log_frame)
+        log_frame.place(x=12,y=y_base+25,width=270,height=150)
+        self.log_list = tk.Listbox(log_frame, height=8, width=38)
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log_list.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        self.log_list = tk.Listbox(log_frame, height=8, width=38,
-                                  yscrollcommand=scrollbar.set, bg="white")
         self.log_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=self.log_list.yview)
-        
-        # Clear log button
-        ttk.Button(self.panel, text="Clear Log", command=self.clear_log).place(x=12, y=y_base + 180, width=270)
-    
+        self.log_list.config(yscrollcommand=scrollbar.set)
+        ttk.Button(self.panel, text="Clear Log", command=self.clear_log).place(x=12,y=y_base+185,width=270)
+
     def draw_intersection(self):
-        """Draw the road intersection"""
         c = self.canvas
-        
-        # Draw roads
-        road_width = 160
-        center_x, center_y = CANVAS_W/2, CANVAS_H/2
-        
-        # Vertical road
-        c.create_rectangle(center_x - road_width/2, 0,
-                          center_x + road_width/2, CANVAS_H,
-                          fill=ROAD_COLOR, outline="")
-        
-        # Horizontal road
-        c.create_rectangle(0, center_y - road_width/2,
-                          CANVAS_W, center_y + road_width/2,
-                          fill=ROAD_COLOR, outline="")
-        
-        # Intersection center
-        c.create_rectangle(center_x - road_width/2, center_y - road_width/2,
-                          center_x + road_width/2, center_y + road_width/2,
-                          fill=CENTER_COLOR, outline="")
-        
-        # Lane markings
-        self.draw_lane_markings()
-        
-        # Direction labels
-        self.draw_direction_labels()
-    
-    def draw_lane_markings(self):
-        """Draw lane markings and arrows"""
-        c = self.canvas
-        center_x, center_y = CANVAS_W/2, CANVAS_H/2
-        
-        # Dashed center lines
-        dash_length = 20
-        gap_length = 10
-        
-        # Vertical dashed line
-        for y in range(0, CANVAS_H, dash_length + gap_length):
-            c.create_line(center_x, y, center_x, y + dash_length,
-                         fill="white", width=2)
-        
-        # Horizontal dashed line
-        for x in range(0, CANVAS_W, dash_length + gap_length):
-            c.create_line(x, center_y, x + dash_length, center_y,
-                         fill="white", width=2)
-    
-    def draw_direction_labels(self):
-        """Draw direction labels"""
-        c = self.canvas
-        
-        labels = [
-            (CANVAS_W/2, 20, "NORTH", "white"),
-            (CANVAS_W/2, CANVAS_H - 20, "SOUTH", "white"),
-            (20, CANVAS_H/2, "WEST", "white"),
-            (CANVAS_W - 20, CANVAS_H/2, "EAST", "white")
-        ]
-        
-        for x, y, text, color in labels:
-            c.create_text(x, y, text=text, fill=color,
-                         font=("Arial", 12, "bold"))
-    
+        road_w = 160
+        cx, cy = CANVAS_W/2, CANVAS_H/2
+        c.create_rectangle(cx-road_w/2, 0, cx+road_w/2, CANVAS_H, fill=ROAD_COLOR, outline="")
+        c.create_rectangle(0, cy-road_w/2, CANVAS_W, cy+road_w/2, fill=ROAD_COLOR, outline="")
+        c.create_rectangle(cx-road_w/2, cy-road_w/2, cx+road_w/2, cy+road_w/2, fill=CENTER_COLOR, outline="")
+
+        # labels
+        c.create_text(CANVAS_W/2, 20, text="NORTH", fill="white", font=("Arial",12,"bold"))
+        c.create_text(CANVAS_W/2, CANVAS_H-20, text="SOUTH", fill="white", font=("Arial",12,"bold"))
+        c.create_text(20, CANVAS_H/2, text="WEST", fill="white", font=("Arial",12,"bold"))
+        c.create_text(CANVAS_W-20, CANVAS_H/2, text="EAST", fill="white", font=("Arial",12,"bold"))
+
     def create_traffic_lights(self):
-        """Create traffic light displays"""
         self.traffic_lights = {}
-        
-        # Positions for each direction
-        positions = {
-            "north": (CANVAS_W/2 + 120, 60),
-            "south": (CANVAS_W/2 - 120, CANVAS_H - 60),
-            "west": (70, CANVAS_H/2 - 120),
-            "east": (CANVAS_W - 70, CANVAS_H/2 + 120)
-        }
-        
-        for direction, (x, y) in positions.items():
-            self.traffic_lights[direction] = self.create_traffic_light(x, y, direction)
-    
-    def create_traffic_light(self, x, y, direction):
-        """Create a single traffic light"""
-        c = self.canvas
-        light_ids = {}
-        
-        # Create light bulbs
-        colors = ["red", "yellow", "green"]
-        for i, color in enumerate(colors):
-            if direction in ("north", "south"):
-                # Vertical arrangement
-                light_x = x
-                light_y = y + (i * 30)
-            else:
-                # Horizontal arrangement
-                light_x = x + (i * 30)
-                light_y = y
-            
-            light_id = c.create_oval(light_x - 12, light_y - 12,
-                                    light_x + 12, light_y + 12,
-                                    fill="#440000" if color == "red" else 
-                                         "#444400" if color == "yellow" else "#004400",
-                                    outline="black", width=2)
-            light_ids[color] = light_id
-        
-        # Create glow effect
-        glow_id = c.create_oval(x - 20, y - 20, x + 20, y + 20,
-                               fill="", outline="", stipple="gray50",
-                               state="hidden")
-        light_ids["glow"] = glow_id
-        
-        return light_ids
-    
-    def update_signals(self, signals, override=False):
-        """Update traffic light colors"""
-        for direction, state in signals.items():
-            lights = self.traffic_lights.get(direction)
-            if not lights:
-                continue
-            
-            # Update each light color
-            for color in ["red", "yellow", "green"]:
-                fill_color = {
-                    "red": "#ff0000" if color == "red" and state == "red" else "#440000",
-                    "yellow": "#ffff00" if color == "yellow" and state == "yellow" else "#444400",
-                    "green": "#00ff00" if color == "green" and state == "green" else "#004400"
-                }[color]
-                
-                self.canvas.itemconfig(lights[color], fill=fill_color)
-            
-            # Update glow effect for green lights
-            if state == "green":
-                self.canvas.itemconfig(lights["glow"], 
-                                      fill="#00ff66" if not override else "#66ffcc",
-                                      state="normal")
+        positions = {"north": (CANVAS_W/2+120, 60), "south": (CANVAS_W/2-120, CANVAS_H-60), 
+                    "west": (70, CANVAS_H/2-120), "east": (CANVAS_W-70, CANVAS_H/2+120)}
+        for d,(x,y) in positions.items():
+            self.traffic_lights[d] = {
+                "red": self.canvas.create_oval(x-12,y-12,x+12,y+12, fill="#440000"),
+                "yellow": self.canvas.create_oval(x-12,y+20,x+12,y+44, fill="#444400"),
+                "green": self.canvas.create_oval(x-12,y+52,x+12,y+76, fill="#004400"),
+                "glow": self.canvas.create_oval(x-24,y-24,x+24,y+24, fill="", state="hidden")
+            }
+
+    def update_signals(self, signals: Dict[str,str], override: bool=False):
+        for d,state in signals.items():
+            lights = self.traffic_lights.get(d)
+            if not lights: continue
+            self.canvas.itemconfig(lights["red"], fill="#ff0000" if state=="red" else "#440000")
+            self.canvas.itemconfig(lights["yellow"], fill="#ffff00" if state=="yellow" else "#444400")
+            self.canvas.itemconfig(lights["green"], fill="#00ff00" if state=="green" else "#004400")
+            if state=="green" and override:
+                self.canvas.itemconfig(lights["glow"], fill="#66ffcc", state="normal")
             else:
                 self.canvas.itemconfig(lights["glow"], state="hidden")
-    
-    def update_timer(self, seconds):
-        """Update timer display"""
+
+    def update_timer(self, seconds: int):
         self.timer_var.set(f"Timer: {seconds}s")
-    
-    def set_status(self, text):
-        """Update status display"""
+
+    def set_status(self, text: str):
         self.status_var.set(text)
-    
-    def log_event(self, text):
-        """Add event to log"""
-        timestamp = time.strftime("%H:%M:%S")
-        self.log_list.insert(0, f"[{timestamp}] {text}")
-        
-        # Limit log size
-        if self.log_list.size() > 100:
-            self.log_list.delete(100, tk.END)
-    
+
+    def log_event(self, text: str):
+        ts = time.strftime("%H:%M:%S")
+        self.log_list.insert(0, f"[{ts}] {text}")
+        if self.log_list.size() > 200:
+            self.log_list.delete(200, tk.END)
+
     def clear_log(self):
-        """Clear event log"""
         self.log_list.delete(0, tk.END)
+        self.log_event("Log cleared")
+
+    def get_vehicle_distance_to_intersection(self, vehicle):
+        """Calculate vehicle's distance to intersection center"""
+        cx, cy = CANVAS_W/2, CANVAS_H/2
+        return math.sqrt((vehicle.x - cx)**2 + (vehicle.y - cy)**2)
+
+    def update_queue_visualization(self):
+        """Update the queue visualization for all directions"""
+        for direction in ["north", "south", "east", "west"]:
+            self.update_direction_queue(direction)
     
+    def update_direction_queue(self, direction: str):
+        """Update queue visualization for a specific direction"""
+        if direction not in self.queue_visualizations:
+            return
+            
+        queue_info = self.queue_visualizations[direction]
+        canvas = queue_info["canvas"]
+        if not canvas:
+            return
+        
+        # Clear existing queue items
+        for item in queue_info["items"]:
+            canvas.delete(item)
+        queue_info["items"] = []
+        
+        # Count vehicles waiting at this signal
+        waiting_vehicles = []
+        for vehicle in self.vehicle_manager.vehicles:
+            if vehicle.direction == direction and vehicle.stopped:
+                # Check if vehicle is within stopping distance
+                cx, cy = CANVAS_W/2, CANVAS_H/2
+                if direction == "north" and cy - vehicle.y < STOP_DIST:
+                    waiting_vehicles.append(vehicle)
+                elif direction == "south" and vehicle.y - cy < STOP_DIST:
+                    waiting_vehicles.append(vehicle)
+                elif direction == "west" and cx - vehicle.x < STOP_DIST:
+                    waiting_vehicles.append(vehicle)
+                elif direction == "east" and vehicle.x - cx < STOP_DIST:
+                    waiting_vehicles.append(vehicle)
+        
+        # Sort by distance to intersection (closest first)
+        waiting_vehicles.sort(key=lambda v: self.get_vehicle_distance_to_intersection(v), reverse=True)
+        
+        # Limit to max display
+        display_vehicles = waiting_vehicles[:QUEUE_MAX_VEHICLES]
+        queue_info["count"] = len(waiting_vehicles)
+        
+        # Draw queue visualization
+        x_pos = 5
+        for i, vehicle in enumerate(display_vehicles):
+            color = QUEUE_COLORS.get(vehicle.vehicle_type, "#3498db")
+            
+            # Draw vehicle rectangle
+            rect = canvas.create_rectangle(
+                x_pos, 5,
+                x_pos + QUEUE_VEHICLE_SIZE, 5 + QUEUE_VEHICLE_SIZE,
+                fill=color, outline="black", width=1
+            )
+            queue_info["items"].append(rect)
+            
+            # Add vehicle type indicator
+            if vehicle.vehicle_type == "ambulance":
+                indicator = canvas.create_text(
+                    x_pos + QUEUE_VEHICLE_SIZE//2, 5 + QUEUE_VEHICLE_SIZE//2,
+                    text="A", fill="white", font=("Arial", 8, "bold")
+                )
+                queue_info["items"].append(indicator)
+            elif vehicle.vehicle_type == "firetruck":
+                indicator = canvas.create_text(
+                    x_pos + QUEUE_VEHICLE_SIZE//2, 5 + QUEUE_VEHICLE_SIZE//2,
+                    text="F", fill="white", font=("Arial", 8, "bold")
+                )
+                queue_info["items"].append(indicator)
+            
+            x_pos += QUEUE_VEHICLE_SIZE + QUEUE_SPACING
+        
+        # If there are more vehicles than we can display, show a count
+        if len(waiting_vehicles) > QUEUE_MAX_VEHICLES:
+            extra_count = len(waiting_vehicles) - QUEUE_MAX_VEHICLES
+            count_text = canvas.create_text(
+                x_pos + 10, 5 + QUEUE_VEHICLE_SIZE//2,
+                text=f"+{extra_count} more", fill="#666", font=("Arial", 8)
+            )
+            queue_info["items"].append(count_text)
+
+    # -------------------------
+    # Simulation controls
+    # -------------------------
     def start_simulation(self):
-        """Start the simulation"""
         if not self.is_running:
             self.is_running = True
             self.controller.start()
@@ -951,98 +794,74 @@ class TrafficUI:
             self.start_animation()
             self.set_status("Simulation running")
             self.log_event("Simulation started")
-    
+
     def stop_simulation(self):
-        """Stop the simulation"""
         if self.is_running:
             self.is_running = False
             self.controller.stop()
-            
-            # Cancel scheduled tasks
-            if self.animation_id:
-                self.root.after_cancel(self.animation_id)
-                self.animation_id = None
-            
             if self.spawn_id:
-                self.root.after_cancel(self.spawn_id)
-                self.spawn_id = None
-            
+                self.root.after_cancel(self.spawn_id); self.spawn_id = None
+            if self.animation_id:
+                self.root.after_cancel(self.animation_id); self.animation_id = None
             self.set_status("Simulation stopped")
             self.log_event("Simulation stopped")
-    
+
     def reset_simulation(self):
-        """Reset the simulation"""
         self.stop_simulation()
-        
-        # Clear all vehicles
         self.vehicle_manager.clear_all()
-        
-        # Reset statistics
-        self.total_var.set(0)
-        self.amb_served_var.set(0)
-        self.fire_served_var.set(0)
-        
-        # Reset controller
+        self.total_var.set(0); self.amb_served_var.set(0); self.fire_served_var.set(0)
         self.controller.emergency_queue.clear()
         self.controller.override_active = False
         self.controller.override_direction = None
+        self.controller.statistics.reset()
         self.controller.set_ns_green()
+        
+        # Clear queue visualizations
+        for direction in self.queue_visualizations:
+            queue_info = self.queue_visualizations[direction]
+            canvas = queue_info["canvas"]
+            if canvas:
+                for item in queue_info["items"]:
+                    canvas.delete(item)
+                queue_info["items"] = []
+                queue_info["count"] = 0
         
         self.set_status("Simulation reset")
         self.log_event("Simulation reset")
-    
+
+    # spawning
     def start_spawning(self):
-        """Start spawning vehicles"""
-        if not self.is_running:
-            return
-        
-        # Spawn a vehicle
-        self.vehicle_manager.spawn_vehicle()
-        
-        # Schedule next spawn
-        spawn_rate = self.spawn_rate_var.get()
-        self.spawn_id = self.root.after(spawn_rate, self.start_spawning)
-    
+        if not self.is_running: return
+        spawned = self.vehicle_manager.spawn_vehicle()
+        if spawned:
+            self.total_var.set(self.vehicle_manager.vehicle_count)
+        rate = int(self.spawn_rate_var.get())
+        self.spawn_id = self.root.after(rate, self.start_spawning)
+
+    # animation
     def start_animation(self):
-        """Start animation loop"""
-        if not self.is_running:
-            return
-        
-        # Update vehicles
-        self.vehicle_manager.update_vehicles(
-            self.controller.signals,
-            self.speed_var.get()
-        )
-        
-        # Schedule next animation frame
+        if not self.is_running: return
+        self.vehicle_manager.update_vehicles(self.controller.signals, self.speed_var.get())
+        self.update_queue_visualization()  # Update queue visualization
         self.animation_id = self.root.after(ANIM_INTERVAL, self.start_animation)
-    
-    def spawn_emergency_vehicle(self, direction, vehicle_type):
-        """Spawn an emergency vehicle"""
-        if self.vehicle_manager.spawn_vehicle(direction, vehicle_type):
-            # Add to controller queue
+
+    # emergency spawn
+    def spawn_emergency_vehicle(self, direction: str, vehicle_type: str):
+        ok = self.vehicle_manager.spawn_vehicle(direction, vehicle_type)
+        if ok:
             self.controller.add_emergency(direction, vehicle_type)
-            
-            # Log event
-            self.log_event(f"Spawned {vehicle_type} from {direction}")
-            
-            # Ensure simulation is running
+            self.log_event(f"Spawned {vehicle_type.upper()} from {direction.upper()}")
             if not self.is_running:
                 self.start_simulation()
         else:
-            self.log_event(f"Could not spawn {vehicle_type} - traffic too dense")
+            self.log_event(f"Could not spawn {vehicle_type} at {direction} (too close)")
 
 # -------------------------
-# Main Application
+# main
 # -------------------------
 def main():
-    # Create main window
     root = tk.Tk()
-    
-    # Create UI
     app = TrafficUI(root)
-    
-    # Start application
     root.mainloop()
 
 if __name__ == "__main__":
